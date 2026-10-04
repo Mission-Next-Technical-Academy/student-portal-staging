@@ -1,1 +1,199 @@
+# Deploy the staging site.
+#
+# Builds a branch (default: `staging`) of Mission-Next-Technical-Academy/student-portal
+# — the single source of truth for all code — and publishes it to this repo's
+# GitHub Pages site, pointed at the STAGING Supabase project instead of production.
+#
+# This repo only hosts the built staging site. Never commit portal code here.
+#
+# Run it from this repo: Actions → "Deploy staging site" → Run workflow.
+#
+# Repository variables this workflow needs (Settings → Secrets and variables →
+# Actions → Variables tab). Both are public by design; neither is a secret:
+#   STAGING_SUPABASE_URL              https://<staging-ref>.supabase.co
+#   STAGING_SUPABASE_PUBLISHABLE_KEY  sb_publishable_...  (never a secret or service-role key)
+name: Deploy staging site
 
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: student-portal branch to deploy
+        required: true
+        default: staging
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# Never let two deploys race; queue them instead.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+env:
+  SOURCE_REPO: Mission-Next-Technical-Academy/student-portal
+  # Production Supabase project ID. The build fails if it appears anywhere in
+  # the staging site, so staging can never talk to production data.
+  PRODUCTION_REF: eokvngifirjgfozzbieu
+  STAGING_SUPABASE_URL: ${{ vars.STAGING_SUPABASE_URL }}
+  STAGING_SUPABASE_PUBLISHABLE_KEY: ${{ vars.STAGING_SUPABASE_PUBLISHABLE_KEY }}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check the staging settings before building anything
+        run: |
+          set -euo pipefail
+          if [ -z "$STAGING_SUPABASE_URL" ] || [ -z "$STAGING_SUPABASE_PUBLISHABLE_KEY" ]; then
+            echo "::error::Set the STAGING_SUPABASE_URL and STAGING_SUPABASE_PUBLISHABLE_KEY repository variables."
+            exit 1
+          fi
+          case "$STAGING_SUPABASE_URL" in
+            *"$PRODUCTION_REF"*) echo "::error::STAGING_SUPABASE_URL points at the PRODUCTION project."; exit 1 ;;
+          esac
+          if ! [[ "$STAGING_SUPABASE_URL" =~ ^https://[a-z0-9]{20}\.supabase\.co$ ]]; then
+            echo "::error::STAGING_SUPABASE_URL must look like https://<project-ref>.supabase.co"
+            exit 1
+          fi
+          # This site is public: only a publishable key may ever be shipped in it.
+          if [[ "$STAGING_SUPABASE_PUBLISHABLE_KEY" != sb_publishable_* ]]; then
+            echo "::error::STAGING_SUPABASE_PUBLISHABLE_KEY must be a publishable key (sb_publishable_...), never a secret or service-role key."
+            exit 1
+          fi
+          echo "Staging target: $STAGING_SUPABASE_URL"
+
+      - name: Check out student-portal (${{ inputs.ref }})
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ inputs.ref }}
+          # Full history so the version number matches production's scheme.
+          fetch-depth: 0
+          persist-credentials: false
+          # If student-portal is ever made private, add a read-only token here:
+          # token: ${{ secrets.SOURCE_REPO_TOKEN }}
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+
+      - name: Validate source (same checks production runs)
+        run: bash bin/ci-check.sh
+
+      - name: Assemble single-origin site (same layout as production)
+        run: |
+          set -euo pipefail
+          mkdir -p _site/sim
+          cp -R portal/. _site/
+          cp -R ui/. _site/sim/
+          touch _site/.nojekyll
+
+          BUILD_VERSION="1.$(git rev-list --count HEAD)-staging.$(git rev-parse --short HEAD)"
+          printf '%s\n' \
+            "/* Generated at deploy time by deploy-staging.yml; do not edit. */" \
+            "const PORTAL_RELEASE = Object.freeze({ version: '${BUILD_VERSION}' });" \
+            > _site/release.js
+          sed -i "s|release.js?v=[^\"]*|release.js?v=${BUILD_VERSION}|" _site/index.html
+          echo "Deploying staging version ${BUILD_VERSION} from ${{ inputs.ref }}"
+
+      - name: Point the site at the staging database
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import os, pathlib, re
+
+          path = pathlib.Path('_site/supabase-config.js')
+          text = path.read_text()
+          text, url_swaps = re.subn(
+              r"const MNT_SUPABASE_URL = '[^']*';",
+              "const MNT_SUPABASE_URL = '" + os.environ['STAGING_SUPABASE_URL'] + "';",
+              text)
+          text, key_swaps = re.subn(
+              r"const MNT_SUPABASE_ANON_KEY = '[^']*';",
+              "const MNT_SUPABASE_ANON_KEY = '" + os.environ['STAGING_SUPABASE_PUBLISHABLE_KEY'] + "';",
+              text)
+          if url_swaps != 1 or key_swaps != 1:
+              raise SystemExit(f'::error::Expected one URL and one key in supabase-config.js, '
+                               f'found {url_swaps} and {key_swaps}. Its format changed; update this step.')
+          path.write_text(text)
+          print('supabase-config.js now points at the staging project')
+          PY
+
+      - name: Mark every page as staging and hide it from search engines
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import pathlib
+
+          meta = '<meta name="robots" content="noindex, nofollow" />'
+          badge = ('<div id="mnt-staging-badge" aria-hidden="true" style="position:fixed;left:12px;bottom:12px;'
+                   'z-index:2147483647;pointer-events:none;padding:6px 10px;border-radius:6px;'
+                   'background:#b45309;color:#fff;font:600 12px/1.2 system-ui,sans-serif;'
+                   'letter-spacing:.04em;box-shadow:0 1px 4px rgba(0,0,0,.25)">'
+                   'STAGING · synthetic data only</div>')
+          pages = 0
+          for page in pathlib.Path('_site').rglob('*.html'):
+              html = page.read_text(errors='ignore')
+              if '</head>' in html and meta not in html:
+                  html = html.replace('</head>', f'  {meta}\n</head>', 1)
+              if '</body>' in html and 'mnt-staging-badge' not in html:
+                  html = html.replace('</body>', f'{badge}\n</body>', 1)
+              page.write_text(html)
+              pages += 1
+          print(f'marked {pages} pages as staging')
+          PY
+
+      - name: Verify the assembled staging site
+        run: |
+          set -euo pipefail
+          test -f _site/index.html
+          test -f _site/sim/index.html
+          test -f _site/vendor/tailwind.js
+          test -f _site/m360/index.html
+          test -f _site/m360-entry.js
+          grep -q 'src="m360-entry.js?v=' _site/index.html
+          grep -Eq "version: '1\.[0-9]+-staging\." _site/release.js
+
+          # The one rule that matters most: no trace of the production project.
+          if grep -rIl "$PRODUCTION_REF" _site; then
+            echo "::error::The files above still reference the PRODUCTION Supabase project. Not deploying."
+            exit 1
+          fi
+          grep -q "$STAGING_SUPABASE_URL" _site/supabase-config.js
+          grep -q 'name="robots" content="noindex' _site/index.html
+          grep -q 'mnt-staging-badge' _site/index.html
+
+          # Same simulator-origin guard production runs.
+          python3 - <<'PY'
+          import pathlib, re, sys
+
+          unguarded = []
+          for path in pathlib.Path('_site').rglob('*.js'):
+              text = path.read_text(errors='ignore')
+              for match in re.finditer(r'127\.0\.0\.1:8767', text):
+                  if 'location.hostname' not in text[max(0, match.start() - 200):match.start()]:
+                      unguarded.append(f'{path}:{text.count(chr(10), 0, match.start()) + 1}')
+          if unguarded:
+              print('::error::Unguarded simulator origin: ' + ', '.join(unguarded))
+              sys.exit(1)
+          print('simulator origin is hostname-guarded')
+          PY
+
+      - uses: actions/configure-pages@v6
+      - uses: actions/upload-pages-artifact@v5
+        with:
+          path: _site
+          include-hidden-files: true
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v5
