@@ -8,6 +8,14 @@
 #
 # Run it from this repo: Actions → "Deploy staging site" → Run workflow.
 #
+# It also starts two other ways:
+#   - student-portal's "Staging sync" workflow dispatches it after every merge
+#     to master (STAGING_DEPLOY_TOKEN; see student-portal's
+#     docs/operations/STAGING_AUTOMATION.md);
+#   - a backup schedule twice a day, which skips the build when the published
+#     site's deploy-sha.txt already matches the current `staging` commit.
+# Manual and dispatched runs always deploy.
+#
 # Repository variables this workflow needs (Settings → Secrets and variables →
 # Actions → Variables tab). Both are public by design; neither is a secret:
 #   STAGING_SUPABASE_URL              https://<staging-ref>.supabase.co
@@ -21,6 +29,13 @@ on:
         description: student-portal branch to deploy
         required: true
         default: staging
+  # Backup in case a dispatch from student-portal was missed. UTC, off the
+  # hour: about 6:17 AM and 1:17 PM in Florida during daylight time.
+  # GitHub disables scheduled workflows after 60 days without repository
+  # activity; re-enable from the Actions tab (see STAGING_AUTOMATION.md).
+  schedule:
+    - cron: '17 10 * * *'
+    - cron: '17 17 * * *'
 
 permissions:
   contents: read
@@ -39,9 +54,45 @@ env:
   PRODUCTION_REF: eokvngifirjgfozzbieu
   STAGING_SUPABASE_URL: ${{ vars.STAGING_SUPABASE_URL }}
   STAGING_SUPABASE_PUBLISHABLE_KEY: ${{ vars.STAGING_SUPABASE_PUBLISHABLE_KEY }}
+  # Scheduled runs have no inputs; they always deploy `staging`.
+  DEPLOY_REF: ${{ inputs.ref || 'staging' }}
 
 jobs:
+  # Scheduled runs only: skip the build when the published site already has
+  # the current `staging` commit. Manual and dispatched runs always deploy.
+  check:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      deploy: ${{ steps.compare.outputs.deploy }}
+    steps:
+      - name: Compare the published deploy-sha.txt with staging
+        id: compare
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          SITE_URL: https://mission-next-technical-academy.github.io/student-portal-staging
+        run: |
+          set -euo pipefail
+          if [ "$EVENT_NAME" != "schedule" ]; then
+            echo "deploy=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          wanted="$(git ls-remote "https://github.com/${SOURCE_REPO}.git" "refs/heads/${DEPLOY_REF}" | cut -f1 || true)"
+          # The query string skips the Pages CDN cache. A missing or unreadable
+          # file just means "deploy".
+          published="$(curl -fsSL --max-time 30 "${SITE_URL}/deploy-sha.txt?t=$(date +%s)" 2>/dev/null | tr -d '[:space:]' || true)"
+          echo "staging is at ${wanted:-unknown}; the site has ${published:-nothing recorded}"
+          if [ -n "$wanted" ] && [ "$wanted" = "$published" ]; then
+            echo "::notice::The staging site already has ${wanted:0:12}; skipping this scheduled build."
+            echo "deploy=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "deploy=true" >> "$GITHUB_OUTPUT"
+          fi
+
   build:
+    needs: check
+    if: needs.check.outputs.deploy == 'true'
     runs-on: ubuntu-latest
     steps:
       - name: Check the staging settings before building anything
@@ -65,11 +116,11 @@ jobs:
           fi
           echo "Staging target: $STAGING_SUPABASE_URL"
 
-      - name: Check out student-portal (${{ inputs.ref }})
+      - name: Check out student-portal (${{ env.DEPLOY_REF }})
         uses: actions/checkout@v7
         with:
           repository: ${{ env.SOURCE_REPO }}
-          ref: ${{ inputs.ref }}
+          ref: ${{ env.DEPLOY_REF }}
           # Full history so the version number matches production's scheme.
           fetch-depth: 0
           persist-credentials: false
@@ -97,7 +148,11 @@ jobs:
             "const PORTAL_RELEASE = Object.freeze({ version: '${BUILD_VERSION}' });" \
             > _site/release.js
           sed -i "s|release.js?v=[^\"]*|release.js?v=${BUILD_VERSION}|" _site/index.html
-          echo "Deploying staging version ${BUILD_VERSION} from ${{ inputs.ref }}"
+          echo "Deploying staging version ${BUILD_VERSION} from ${DEPLOY_REF}"
+
+          # The scheduled run compares this with the current staging commit
+          # and skips the build when they match.
+          git rev-parse HEAD > _site/deploy-sha.txt
 
       - name: Point the site at the staging database
         run: |
@@ -156,6 +211,7 @@ jobs:
           test -f _site/m360-entry.js
           grep -q 'src="m360-entry.js?v=' _site/index.html
           grep -Eq "version: '1\.[0-9]+-staging\." _site/release.js
+          grep -Eqx '[0-9a-f]{40}' _site/deploy-sha.txt
 
           # The one rule that matters most: no trace of the production project.
           if grep -rIl "$PRODUCTION_REF" _site; then
