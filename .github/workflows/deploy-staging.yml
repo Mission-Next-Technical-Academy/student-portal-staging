@@ -22,7 +22,7 @@ on:
   workflow_dispatch:
     inputs:
       ref:
-        description: student-portal branch to deploy
+        description: student-portal branch or full 40-character commit SHA to deploy
         required: true
         default: staging
 
@@ -43,6 +43,7 @@ env:
   PRODUCTION_REF: eokvngifirjgfozzbieu
   STAGING_SUPABASE_URL: ${{ vars.STAGING_SUPABASE_URL }}
   STAGING_SUPABASE_PUBLISHABLE_KEY: ${{ vars.STAGING_SUPABASE_PUBLISHABLE_KEY }}
+  # A branch name or a full commit SHA (Staging sync sends the SHA).
   # Passed to scripts through the environment, never pasted into them.
   DEPLOY_REF: ${{ inputs.ref || 'staging' }}
 
@@ -81,6 +82,23 @@ jobs:
           persist-credentials: false
           # If student-portal is ever made private, add a read-only token here:
           # token: ${{ secrets.SOURCE_REPO_TOKEN }}
+
+      - name: Confirm the checked-out commit
+        run: |
+          set -euo pipefail
+          built="$(git rev-parse HEAD)"
+          # A full SHA must be checked out exactly; anything else is a branch.
+          if [[ "$DEPLOY_REF" =~ ^[0-9a-fA-F]{40}$ ]] &&
+             [ "$(printf '%s' "$DEPLOY_REF" | tr 'A-F' 'a-f')" != "$built" ]; then
+            echo "::error::Asked to deploy commit $DEPLOY_REF but checked out $built."
+            exit 1
+          fi
+          echo "Building student-portal commit $built (requested: $DEPLOY_REF)"
+          {
+            echo "### Staging deploy"
+            echo "- Requested ref: \`$DEPLOY_REF\`"
+            echo "- Built commit: \`$built\`"
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - uses: actions/setup-node@v7
         with:
