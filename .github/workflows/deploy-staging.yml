@@ -8,15 +8,9 @@
 #
 # Run it from this repo: Actions → "Deploy staging site" → Run workflow.
 #
-# It also starts two other ways:
-#   - student-portal's "Staging sync" workflow dispatches it after every merge
-#     to master (STAGING_DEPLOY_TOKEN; see student-portal's
-#     docs/operations/STAGING_AUTOMATION.md);
-#   - a backup schedule twice a day, which skips the build when the published
-#     site's deploy-fingerprint.txt shows it was built from the current
-#     `staging` commit, this workflow's current commit, and the current
-#     staging variables.
-# Manual and dispatched runs always deploy.
+# student-portal's "Staging sync" workflow also dispatches it after every merge
+# to master (STAGING_DEPLOY_TOKEN; see student-portal's
+# docs/operations/STAGING_AUTOMATION.md). Every run builds and deploys.
 #
 # Repository variables this workflow needs (Settings → Secrets and variables →
 # Actions → Variables tab). Both are public by design; neither is a secret:
@@ -31,13 +25,6 @@ on:
         description: student-portal branch to deploy
         required: true
         default: staging
-  # Backup in case a dispatch from student-portal was missed. UTC, off the
-  # hour: about 6:17 AM and 1:17 PM in Florida during daylight time.
-  # GitHub disables scheduled workflows after 60 days without repository
-  # activity; re-enable from the Actions tab (see STAGING_AUTOMATION.md).
-  schedule:
-    - cron: '17 10 * * *'
-    - cron: '17 17 * * *'
 
 permissions:
   contents: read
@@ -56,58 +43,11 @@ env:
   PRODUCTION_REF: eokvngifirjgfozzbieu
   STAGING_SUPABASE_URL: ${{ vars.STAGING_SUPABASE_URL }}
   STAGING_SUPABASE_PUBLISHABLE_KEY: ${{ vars.STAGING_SUPABASE_PUBLISHABLE_KEY }}
-  # Scheduled runs have no inputs; they always deploy `staging`.
+  # Passed to scripts through the environment, never pasted into them.
   DEPLOY_REF: ${{ inputs.ref || 'staging' }}
 
 jobs:
-  # Scheduled runs only: skip the build when the published site was built
-  # from exactly the same inputs: the same `staging` commit, the same commit
-  # of this repository (so a change to this workflow rebuilds), and the same
-  # staging URL and publishable key (so a rotated key or a changed variable
-  # rebuilds and is re-checked). Manual and dispatched runs always deploy.
-  check:
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-    outputs:
-      deploy: ${{ steps.compare.outputs.deploy }}
-      build-inputs: ${{ steps.compare.outputs.build-inputs }}
-    steps:
-      - name: Compare the published deploy fingerprint with the current inputs
-        id: compare
-        env:
-          EVENT_NAME: ${{ github.event_name }}
-          BUILD_SHA: ${{ github.sha }}
-          SITE_URL: https://mission-next-technical-academy.github.io/student-portal-staging
-        run: |
-          set -euo pipefail
-          # Both variables are public by design (the key ships in the site),
-          # and only a hash of them is published or logged.
-          config="$(printf '%s\n%s' "$STAGING_SUPABASE_URL" "$STAGING_SUPABASE_PUBLISHABLE_KEY" | sha256sum | cut -d' ' -f1)"
-          build_inputs="build=${BUILD_SHA} config=${config}"
-          echo "build-inputs=${build_inputs}" >> "$GITHUB_OUTPUT"
-
-          if [ "$EVENT_NAME" != "schedule" ]; then
-            echo "deploy=true" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          wanted="$(git ls-remote "https://github.com/${SOURCE_REPO}.git" "refs/heads/${DEPLOY_REF}" | cut -f1 || true)"
-          # The query string skips the Pages CDN cache. A missing or unreadable
-          # file just means "deploy".
-          published="$(curl -fsSL --max-time 30 "${SITE_URL}/deploy-fingerprint.txt?t=$(date +%s)" 2>/dev/null | tr -d '\n' || true)"
-          expected="source=${wanted} ${build_inputs}"
-          echo "current inputs:  ${expected}"
-          echo "published build: ${published:-nothing recorded}"
-          if [ -n "$wanted" ] && [ "$expected" = "$published" ]; then
-            echo "::notice::The staging site was already built from staging ${wanted:0:12} with this workflow and these settings; skipping this scheduled build."
-            echo "deploy=false" >> "$GITHUB_OUTPUT"
-          else
-            echo "deploy=true" >> "$GITHUB_OUTPUT"
-          fi
-
   build:
-    needs: check
-    if: needs.check.outputs.deploy == 'true'
     runs-on: ubuntu-latest
     steps:
       - name: Check the staging settings before building anything
@@ -150,8 +90,6 @@ jobs:
         run: bash bin/ci-check.sh
 
       - name: Assemble single-origin site (same layout as production)
-        env:
-          BUILD_INPUTS: ${{ needs.check.outputs.build-inputs }}
         run: |
           set -euo pipefail
           mkdir -p _site/sim
@@ -168,10 +106,7 @@ jobs:
           echo "Deploying staging version ${BUILD_VERSION} from ${DEPLOY_REF}"
 
           # deploy-sha.txt: the deployed student-portal commit, for people.
-          # deploy-fingerprint.txt: what the scheduled run compares (see the
-          # check job) to decide whether anything changed.
           git rev-parse HEAD > _site/deploy-sha.txt
-          echo "source=$(git rev-parse HEAD) ${BUILD_INPUTS}" > _site/deploy-fingerprint.txt
 
       - name: Point the site at the staging database
         run: |
@@ -231,7 +166,6 @@ jobs:
           grep -q 'src="m360-entry.js?v=' _site/index.html
           grep -Eq "version: '1\.[0-9]+-staging\." _site/release.js
           grep -Eqx '[0-9a-f]{40}' _site/deploy-sha.txt
-          grep -Eqx 'source=[0-9a-f]{40} build=[0-9a-f]{40} config=[0-9a-f]{64}' _site/deploy-fingerprint.txt
 
           # The one rule that matters most: no trace of the production project.
           if grep -rIl "$PRODUCTION_REF" _site; then
