@@ -8,6 +8,10 @@
 #
 # Run it from this repo: Actions → "Deploy staging site" → Run workflow.
 #
+# student-portal's "Staging sync" workflow also dispatches it after every merge
+# to master (STAGING_DEPLOY_TOKEN; see student-portal's
+# docs/operations/STAGING_AUTOMATION.md). Every run builds and deploys.
+#
 # Repository variables this workflow needs (Settings → Secrets and variables →
 # Actions → Variables tab). Both are public by design; neither is a secret:
 #   STAGING_SUPABASE_URL              https://<staging-ref>.supabase.co
@@ -18,7 +22,7 @@ on:
   workflow_dispatch:
     inputs:
       ref:
-        description: student-portal branch to deploy
+        description: student-portal branch or full 40-character commit SHA to deploy
         required: true
         default: staging
 
@@ -39,6 +43,9 @@ env:
   PRODUCTION_REF: eokvngifirjgfozzbieu
   STAGING_SUPABASE_URL: ${{ vars.STAGING_SUPABASE_URL }}
   STAGING_SUPABASE_PUBLISHABLE_KEY: ${{ vars.STAGING_SUPABASE_PUBLISHABLE_KEY }}
+  # A branch name or a full commit SHA (Staging sync sends the SHA).
+  # Passed to scripts through the environment, never pasted into them.
+  DEPLOY_REF: ${{ inputs.ref || 'staging' }}
 
 jobs:
   build:
@@ -65,16 +72,33 @@ jobs:
           fi
           echo "Staging target: $STAGING_SUPABASE_URL"
 
-      - name: Check out student-portal (${{ inputs.ref }})
+      - name: Check out student-portal (${{ env.DEPLOY_REF }})
         uses: actions/checkout@v7
         with:
           repository: ${{ env.SOURCE_REPO }}
-          ref: ${{ inputs.ref }}
+          ref: ${{ env.DEPLOY_REF }}
           # Full history so the version number matches production's scheme.
           fetch-depth: 0
           persist-credentials: false
           # If student-portal is ever made private, add a read-only token here:
           # token: ${{ secrets.SOURCE_REPO_TOKEN }}
+
+      - name: Confirm the checked-out commit
+        run: |
+          set -euo pipefail
+          built="$(git rev-parse HEAD)"
+          # A full SHA must be checked out exactly; anything else is a branch.
+          if [[ "$DEPLOY_REF" =~ ^[0-9a-fA-F]{40}$ ]] &&
+             [ "$(printf '%s' "$DEPLOY_REF" | tr 'A-F' 'a-f')" != "$built" ]; then
+            echo "::error::Asked to deploy commit $DEPLOY_REF but checked out $built."
+            exit 1
+          fi
+          echo "Building student-portal commit $built (requested: $DEPLOY_REF)"
+          {
+            echo "### Staging deploy"
+            echo "- Requested ref: \`$DEPLOY_REF\`"
+            echo "- Built commit: \`$built\`"
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - uses: actions/setup-node@v7
         with:
@@ -97,7 +121,10 @@ jobs:
             "const PORTAL_RELEASE = Object.freeze({ version: '${BUILD_VERSION}' });" \
             > _site/release.js
           sed -i "s|release.js?v=[^\"]*|release.js?v=${BUILD_VERSION}|" _site/index.html
-          echo "Deploying staging version ${BUILD_VERSION} from ${{ inputs.ref }}"
+          echo "Deploying staging version ${BUILD_VERSION} from ${DEPLOY_REF}"
+
+          # deploy-sha.txt: the deployed student-portal commit, for people.
+          git rev-parse HEAD > _site/deploy-sha.txt
 
       - name: Point the site at the staging database
         run: |
@@ -156,6 +183,7 @@ jobs:
           test -f _site/m360-entry.js
           grep -q 'src="m360-entry.js?v=' _site/index.html
           grep -Eq "version: '1\.[0-9]+-staging\." _site/release.js
+          grep -Eqx '[0-9a-f]{40}' _site/deploy-sha.txt
 
           # The one rule that matters most: no trace of the production project.
           if grep -rIl "$PRODUCTION_REF" _site; then
